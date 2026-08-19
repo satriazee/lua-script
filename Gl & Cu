@@ -1,0 +1,289 @@
+;;; ============================================================
+;;; GL_CU_Combined.lsp
+;;; Berisi 2 command: GL (Get Length) dan CU (Cari Unit)
+;;;
+;;; ------------------- COMMAND: GL -------------------
+;;; Cara pakai:
+;;; 1. Load script ini di AutoCAD: ketik APPLOAD, pilih file .lsp ini
+;;; 2. Buka Excel-nya, klik cell yang mau diisi (kolom hasil, misal
+;;;    sebaris dengan "BJLS")
+;;; 3. Balik ke AutoCAD, ketik: GL  lalu Enter
+;;; 4. Pilih polyline / line yang mau diukur
+;;; 5. Panjangnya otomatis ketulis di cell Excel yang tadi aktif
+;;; 6. Buat baris berikutnya: klik cell lain di Excel, balik ke
+;;;    AutoCAD, ketik GL lagi, pilih polyline berikutnya
+;;;
+;;; Unit drawing dibaca OTOMATIS dari system variable INSUNITS
+;;; AutoCAD, terus dikonversi ke METER (unit target di Excel).
+;;; Jadi kamu tidak perlu set unit manual lagi -> auto-adjust
+;;; tiap kali buka drawing dengan unit berbeda.
+;;; ============================================================
+
+;; Fungsi bantu: kembalikan faktor konversi ke meter berdasarkan
+;; kode INSUNITS AutoCAD
+(defun get-unit-factor-to-meter ( / insunits)
+  (setq insunits (getvar "INSUNITS"))
+  (cond
+    ((= insunits 0) 1.0)      ; Unitless -> anggap sudah meter
+    ((= insunits 1) 0.0254)   ; Inches
+    ((= insunits 2) 0.3048)   ; Feet
+    ((= insunits 3) 1609.34)  ; Miles
+    ((= insunits 4) 0.001)    ; Millimeters
+    ((= insunits 5) 0.01)     ; Centimeters
+    ((= insunits 6) 1.0)      ; Meters
+    ((= insunits 7) 1000.0)   ; Kilometers
+    ((= insunits 8) 0.0000254); Microinches
+    ((= insunits 9) 0.0000000254) ; Mils
+    ((= insunits 10) 0.9144)  ; Yards
+    ((= insunits 11) 1e-10)   ; Angstroms
+    ((= insunits 12) 1e-9)    ; Nanometers
+    ((= insunits 13) 1e-6)    ; Microns
+    ((= insunits 14) 0.1)     ; Decimeters
+    ((= insunits 15) 10.0)    ; Decameters
+    ((= insunits 16) 100.0)   ; Hectometers
+    ((= insunits 17) 1e9)     ; Gigameters
+    ((= insunits 18) 1.496e11); Astronomical units
+    ((= insunits 19) 9.461e15); Light years
+    ((= insunits 20) 3.086e16); Parsecs
+    (t 1.0)                  ; default: anggap meter
+  )
+)
+
+(defun C:GL ( / ent obj entType len totalLen segCount excelApp cell result
+                *unit-factor* insunits-code oldError keepPicking)
+
+  ;; Simpan error handler lama, pasang error handler custom biar
+  ;; kalau ada apa-apa di tengah jalan, Excel object selalu
+  ;; dibersihkan (di-release) dan tidak numpuk jadi proses hantu
+  ;; yang bikin AutoCAD berat/crash.
+  (setq oldError *error*)
+  (defun *error* (msg)
+    (if (and cell (= (type cell) 'VLA-OBJECT))
+      (vl-catch-all-apply 'vlax-release-object (list cell))
+    )
+    (if (and excelApp (= (type excelApp) 'VLA-OBJECT))
+      (vl-catch-all-apply 'vlax-release-object (list excelApp))
+    )
+    (setq *error* oldError)
+    (if (and msg (/= msg "Function cancelled"))
+      (princ (strcat "\nGL dihentikan: " msg))
+    )
+    (princ)
+  )
+
+  ;; 1. Loop: pilih polyline berkali-kali, jumlahin panjangnya.
+  ;;    Pencet Enter tanpa pilih objek buat selesai & tulis ke Excel.
+  ;;    Berguna buat round duct / ducting yang digambar putus-putus
+  ;;    jadi beberapa polyline terpisah tapi sebenarnya satu jalur.
+  (setq totalLen 0.0)
+  (setq segCount 0)
+  (setq keepPicking T)
+
+  (while keepPicking
+    (setq ent
+      (car
+        (entsel
+          (if (= segCount 0)
+            "\nPilih polyline/line untuk diukur (Enter tanpa pilih = selesai): "
+            (strcat
+              "\nTotal sementara: " (rtos totalLen 2 3)
+              " (satuan drawing), " (itoa segCount)
+              " segmen. Pilih lagi atau Enter untuk selesai: "
+            )
+          )
+        )
+      )
+    )
+
+    (cond
+      ;; User pencet Enter kosong -> selesai milih
+      ((not ent)
+        (setq keepPicking nil)
+      )
+
+      ;; Objek terpilih bukan garis/curve yang bisa diukur
+      ((not (member (cdr (assoc 0 (entget ent)))
+                    '("LINE" "LWPOLYLINE" "POLYLINE" "ARC" "CIRCLE" "SPLINE" "ELLIPSE")))
+        (princ
+          (strcat
+            "\nDilewati, bukan garis/polyline (kepencet: "
+            (cdr (assoc 0 (entget ent)))
+            "). Coba klik lebih tepat di garis polyline-nya."
+          )
+        )
+      )
+
+      ;; Objek valid -> tambahin ke total
+      (t
+        (setq obj (vlax-ename->vla-object ent))
+        (setq len
+          (vlax-curve-getDistAtParam
+            obj
+            (vlax-curve-getEndParam obj)
+          )
+        )
+        (setq totalLen (+ totalLen len))
+        (setq segCount (1+ segCount))
+        ;; Highlight sementara biar keliatan yang mana aja yang udah dipilih
+        (redraw ent 3)
+      )
+    )
+  )
+
+  ;; 2. Kalau nggak ada satupun segmen valid terpilih, berhenti di sini
+  (if (= segCount 0)
+    (princ "\nTidak ada objek valid dipilih, tidak ada yang ditulis ke Excel.")
+    (progn
+      ;; 3. Auto-deteksi unit drawing & konversi ke meter
+      (setq insunits-code (getvar "INSUNITS"))
+      (setq *unit-factor* (get-unit-factor-to-meter))
+      (setq result (* totalLen *unit-factor*))
+
+      ;; 4. Konek ke Excel yang lagi kebuka
+      (setq excelApp (vlax-get-or-create-object "Excel.Application"))
+
+      (if (not excelApp)
+        (princ "\nExcel tidak terdeteksi. Pastikan Excel sudah dibuka.")
+        (progn
+          ;; 5. Ambil cell yang lagi aktif di Excel, tulis nilainya
+          (setq cell (vlax-get-property excelApp "ActiveCell"))
+
+          (if (not cell)
+            (princ "\nTidak bisa membaca cell aktif di Excel. Pastikan ada workbook yang terbuka dan sebuah cell sedang dipilih.")
+            (progn
+              (vlax-put-property cell "Value2" result)
+
+              ;; 5b. Format cell dengan pemisah ribuan, tanpa desimal
+              (vlax-put-property cell "NumberFormat" "#,##0")
+
+              ;; 6. Info di command line AutoCAD (termasuk unit yang kedeteksi)
+              (princ
+                (strcat
+                  "\n" (itoa segCount) " segmen dijumlah | Unit drawing: "
+                  (cond
+                    ((= insunits-code 1) "Inches")
+                    ((= insunits-code 2) "Feet")
+                    ((= insunits-code 4) "Millimeters")
+                    ((= insunits-code 5) "Centimeters")
+                    ((= insunits-code 6) "Meters")
+                    ((= insunits-code 14) "Decimeters")
+                    (t "Tidak diketahui/Unitless (dianggap meter)")
+                  )
+                  " | Total panjang asli: " (rtos totalLen 2 3)
+                  " -> " (rtos result 2 3) " m ditulis ke Excel."
+                )
+              )
+
+              ;; Release cell object
+              (vlax-release-object cell)
+              (setq cell nil)
+            )
+          )
+
+          ;; Release Excel application object
+          (vlax-release-object excelApp)
+          (setq excelApp nil)
+        )
+      )
+    )
+  )
+
+  ;; Kembalikan error handler ke semula
+  (setq *error* oldError)
+  (princ)
+)
+
+(princ "\nGL loaded. Ketik GL untuk mulai.")
+(princ)
+
+
+;;; ============================================================
+;;; Command: CU  (Cari Unit)
+;;;
+;;; Cara pakai:
+;;; 1. Ketik CU di AutoCAD
+;;; 2. Ketik nama unit yang dicari, misal: EF-1.ST.1
+;;; 3. AutoCAD otomatis scan semua TEXT/MTEXT di drawing,
+;;;    cari yang mengandung teks itu (tidak perlu sama persis),
+;;;    lalu zoom & highlight ke lokasinya.
+;;; 4. Kalau ada lebih dari satu yang cocok, akan zoom ke yang
+;;;    pertama ketemu, dan command line kasih tau ada berapa
+;;;    total yang cocok.
+;;; ============================================================
+
+(defun C:CU ( / searchStr ss i ent obj txt matches minPt maxPt
+                marginX marginY pt1 pt2 targetEnt targetObj)
+
+  (setq searchStr (getstring T "\nMasukkan nama unit yang dicari (misal EF-1.ST.1): "))
+
+  (if (or (not searchStr) (= (strcase searchStr) ""))
+    (princ "\nTidak ada input.")
+    (progn
+      (setq matches '())
+
+      ;; Ambil semua TEXT dan MTEXT di seluruh drawing
+      (setq ss (ssget "_X" (list (cons 0 "TEXT,MTEXT"))))
+
+      (if ss
+        (progn
+          (setq i 0)
+          (while (< i (sslength ss))
+            (setq ent (ssname ss i))
+            (setq obj (vlax-ename->vla-object ent))
+            (setq txt (vla-get-TextString obj))
+            (if (and txt (vl-string-search (strcase searchStr) (strcase txt)))
+              (setq matches (cons ent matches))
+            )
+            (setq i (1+ i))
+          )
+        )
+      )
+      (setq matches (reverse matches))
+
+      (cond
+        ((= (length matches) 0)
+          (princ (strcat "\nTidak ditemukan text yang cocok dengan: " searchStr))
+        )
+        (t
+          (progn
+            (setq targetEnt (car matches))
+            (setq targetObj (vlax-ename->vla-object targetEnt))
+
+            ;; Ambil bounding box object, kasih margin biar kelihatan
+            ;; konteks sekitarnya juga (bukan cuma text-nya doang)
+            (vla-GetBoundingBox targetObj 'minPt 'maxPt)
+            (setq minPt (vlax-safearray->list minPt))
+            (setq maxPt (vlax-safearray->list maxPt))
+
+            (setq marginX (max 5.0 (* 8.0 (- (car maxPt) (car minPt)))))
+            (setq marginY (max 5.0 (* 8.0 (- (cadr maxPt) (cadr minPt)))))
+
+            (setq pt1 (list (- (car minPt) marginX) (- (cadr minPt) marginY)))
+            (setq pt2 (list (+ (car maxPt) marginX) (+ (cadr maxPt) marginY)))
+
+            ;; Zoom ke area tersebut
+            (command "_.ZOOM" "_W" pt1 pt2)
+
+            ;; Highlight objectnya biar keliatan jelas dipilih
+            (sssetfirst nil (ssadd targetEnt))
+
+            (princ
+              (strcat
+                "\nDitemukan " (itoa (length matches)) " text cocok. "
+                "Zoom ke: \"" (vla-get-TextString targetObj) "\""
+              )
+            )
+            (if (> (length matches) 1)
+              (princ "\n(Ada lebih dari satu yang cocok — cek juga yang lain kalau perlu, jalankan CU lagi dengan kata kunci lebih spesifik.)")
+            )
+          )
+        )
+      )
+      (princ)
+    )
+  )
+  (princ)
+)
+
+(princ "\nCU loaded. Ketik CU untuk cari & zoom ke unit berdasarkan text di drawing.")
+(princ)
