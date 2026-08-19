@@ -1,1 +1,1 @@
-loadstring(game:HttpGet("https://muihub.dev/s/e0d9a52ae55b201222ac08518f51c29b"))()
+loadstring(game:HttpGet("https://muihub.dev/s/a47f8ae442032ee73776a7a74a8dcd62"))()
